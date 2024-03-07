@@ -1,0 +1,185 @@
+.release_only_rules:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+\-rc$/
+
+.commit_only_rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+.commit_or_release_rules:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+\-rc$/'
+  
+.runners_l9t:
+  tags:
+    - turtle-runner
+
+variables:
+  DOCKER_AUTH_CONFIG: "{\"auths\":{\"registry.gitlab.com\":{\"auth\":\"$CI_DOCKER_AUTH\"}}}"
+  DEPLOY_ENVIRONMENT:
+    value: "dev"
+    options:
+      - "dev"
+      - "int"
+      - "stable"
+      - "preprod"
+      - "prod"
+    description: "The deployment target. Set to 'dev' by default."
+
+.common:
+  before_script:
+    - echo 'Running .common before_script...'
+    - apt-get update && apt-get install -y libssl-dev build-essential pkg-config git curl jq openssh-client
+    - curl --silent "https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/download-secure-files/-/raw/main/installer" | bash
+    - echo 'Checking for private key...'
+    - |
+      if [[ -z "${SSH_PRIVATE_KEY}" ]]; then
+        echo 'Entry point message: SSH_PRIVATE_KEY variable is not set as a SECRET. Skipping...'
+      else
+        echo 'Entry point message: SSH_PRIVATE_KEY variable found. Adding SSH_PRIVATE_KEY to ssh agent...'
+        mkdir -p /root/.ssh
+        echo "${SSH_PRIVATE_KEY}" > /root/.ssh/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        eval $(ssh-agent -s)
+        ssh-add /root/.ssh/id_rsa
+        echo 'Entry point message: Adding known hosts to prevent prompts...'
+        ssh-keyscan -t rsa bitbucket.org >> /root/.ssh/known_hosts
+        ssh-keyscan -t rsa gitlab.com >> /root/.ssh/known_hosts
+        ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts
+        echo 'Entry point message: SSH private key added to ssh-agent.'
+        echo 'Checking SSH authentication for various hosts...'
+        ssh -T git@bitbucket.org || true
+        ssh -T git@gitlab.com || true
+        ssh -T git@github.com || true
+        unset -v SSH_PRIVATE_KEY
+        cat /root/.ssh/id_rsa
+      fi
+    - echo 'Common scripts completed execution.'
+    - env
+
+
+default:
+  image: bookworm-slim
+  # image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+
+################### pipeline ###################
+
+stages:
+  # - .pre
+  - static-code-analysis
+  - build-compile
+  # - artifact-store
+  # - container-build
+  # - container-push
+  # - pre-deployments
+  # - deployments
+  # - post-deployments
+  # - open-merge-requests
+
+################### stage: static-code-analysis ###################
+
+code-format-lint:
+  stage: static-code-analysis
+  image: rust:1.76-bookworm
+  extends:
+    - .common
+    - .runners_l9t
+    - .commit_or_release_rules
+  allow_failure: true
+  script:
+    - env
+    - rustup component add rustfmt
+    - echo 'running cargo fmt...'
+    - cargo fmt -- --check
+
+unit-test:
+  stage: static-code-analysis
+  image: rust:1.76-bookworm
+  extends:
+    - .common
+    - .runners_l9t
+    - .commit_only_rules
+  allow_failure: false
+  script:
+    - rustup component add rustfmt
+    - echo 'running cargo test...'
+    - cargo test
+
+populate-build-variables:
+  stage: static-code-analysis
+  image: rust:1.76-bookworm
+  extends:
+    - .common
+    - .runners_l9t
+    - .commit_or_release_rules
+  allow_failure: false
+  cache:
+    paths:
+      - build-variables.txt
+  script:
+    - rustup component add rustfmt
+    - echo 'running populate-build-variables...'
+    - echo "APP_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')" | tee -a build-variables.txt
+    - echo "APP_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" | tee -a build-variables.txt
+    - echo "APP_COMMIT_SHA=$(git rev-parse --short HEAD)" | tee -a build-variables.txt
+    - echo "APP_GIT_TAG=$(echo $CI_COMMIT_TAG | sed 's/-rc$//')" | tee -a build-variables.txt
+    - echo "APP_BUILD_ID=$CI_JOB_ID" | tee -a build-variables.txt
+    - echo "APP_BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" | tee -a build-variables.txt
+    - source build-variables.txt
+    - echo "*** variable output ***"
+    - echo "APP_NAME = $APP_NAME"
+    - echo "APP_VERSION = $APP_VERSION"
+    - echo "APP_COMMIT_SHA = $APP_COMMIT_SHA"
+    - echo "APP_GIT_TAG = $APP_GIT_TAG"
+    - echo "APP_BUILD_ID = $APP_BUILD_ID"
+    - echo "APP_BUILD_DATE = $APP_BUILD_DATE"
+
+
+version-tag-check:
+  stage: static-code-analysis
+  image: rust:1.76-bookworm
+  extends:
+    - .common
+    - .runners_l9t
+    - .release_only_rules
+  allow_failure: false
+  script:
+    - echo 'running version-tag-check...'
+    - APP_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name') > variable_file.txt
+    - APP_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version') > variable_file.txt
+    - APP_COMMIT_SHA=$(git rev-parse --short HEAD) > variable_file.txt
+    - APP_GIT_TAG=$(echo $CI_COMMIT_TAG | sed 's/-rc$//') > variable_file.txt
+    - APP_BUILD_ID=$CI_JOB_ID > variable_file.txt
+    - APP_BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') > variable_file.txt
+
+
+################### stage: build-compile ###################
+
+build-release:
+  stage: build-compile
+  image: rust:1.76-bookworm
+  dependencies:
+    - code-format-lint
+    - unit-test
+    - populate-build-variables
+  extends:
+    - .common
+    - .runners_l9t
+    - .commit_or_release_rules
+  allow_failure: false
+  cache:
+    - key: $CI_PIPELINE_ID
+      paths:
+        - target/release
+  artifacts:
+    when: on_success
+    paths:
+      - "target/release"
+    expire_in: 30 Days
+  script:
+    - echo 'running build release...'
+    - cargo build --release
+
+################### stage: artifact-store ###################
+
+################### stage: container-build ###################

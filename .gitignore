@@ -1,0 +1,11 @@
+target/**
+Cargo.lock
+**/node_modules/**
+
+turtle-tui/login.json
+turtle-tui/theme.json
+dist/
+.git
+.DS_Store
+.idea
+.sqlx/
